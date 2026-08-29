@@ -6,9 +6,29 @@ Codex threads can carry a surprisingly large amount of hidden bootstrap context 
 
 `codex-context` watches Codex's local session telemetry, automatically treats the initial context as a baseline, and tracks how much the working thread grows beyond it.
 
+## Live meter
+
+The meter updates in place every second. The filled bar, percentage, and status change color automatically as the thread grows.
+
 ```text
-lore  ███████████░░░░░░░░░░░░░  46%  46.2k / 100k  🟢 HEALTHY
+🟢  lore  ███████████░░░░░░░░░░░░░  46%  46.2k / 100k  HEALTHY
+🟡  lore  █████████████████░░░░░░░  74%  74.0k / 100k  CONTEXT GETTING FULL
+🟠  lore  ████████████████████░░░░  85%  85.0k / 100k  WRAP UP SOON
+🔴  lore  ██████████████████████░░  93%  93.0k / 100k  NEW THREAD RECOMMENDED
 ```
+
+> In a real terminal, the filled bar and percentage use matching ANSI colors: green → yellow → orange → red. GitHub README code blocks cannot render those terminal ANSI colors, so the colored status dots above show the same progression visually.
+
+### Health states
+
+| Thread growth | Meter color | Status |
+| --- | --- | --- |
+| `< 70k` | 🟢 Green | **HEALTHY** |
+| `70–82k` | 🟡 Yellow | **CONTEXT GETTING FULL** |
+| `82–90k` | 🟠 Orange | **WRAP UP SOON** |
+| `90k+` | 🔴 Red | **NEW THREAD RECOMMENDED** |
+
+These thresholds are intentionally opinionated workflow recommendations, not OpenAI product limits.
 
 ## Why
 
@@ -34,17 +54,6 @@ The default meter applies a deliberately conservative **100,000-token working ca
 - No network requests
 - Reads Codex telemetry locally
 - Works with Codex Desktop session rollouts
-
-## Health states
-
-| Thread growth | Status |
-| --- | --- |
-| `< 70k` | 🟢 HEALTHY |
-| `70–82k` | 🟡 CONTEXT GETTING FULL |
-| `82–90k` | 🟠 WRAP UP SOON |
-| `90k+` | 🔴 NEW THREAD RECOMMENDED |
-
-These thresholds are intentionally opinionated workflow recommendations, not OpenAI product limits.
 
 ## Requirements
 
