@@ -11,10 +11,10 @@ Codex threads can carry a surprisingly large amount of hidden bootstrap context 
 The meter updates in place every second. The filled bar, percentage, and status change color automatically as the thread grows.
 
 ```text
-🟢  lore  ███████████░░░░░░░░░░░░░  46%  46.2k / 100k  HEALTHY
-🟡  lore  █████████████████░░░░░░░  74%  74.0k / 100k  CONTEXT GETTING FULL
-🟠  lore  ████████████████████░░░░  85%  85.0k / 100k  WRAP UP SOON
-🔴  lore  ██████████████████████░░  93%  93.0k / 100k  NEW THREAD RECOMMENDED
+🟢  my-project  ███████████░░░░░░░░░░░░░  46%  46.2k / 100k  HEALTHY
+🟡  my-project  █████████████████░░░░░░░  74%  74.0k / 100k  CONTEXT GETTING FULL
+🟠  my-project  ████████████████████░░░░  85%  85.0k / 100k  WRAP UP SOON
+🔴  my-project  ██████████████████████░░  93%  93.0k / 100k  NEW THREAD RECOMMENDED
 ```
 
 > In a real terminal, the filled bar and percentage use matching ANSI colors: green → yellow → orange → red. GitHub README code blocks cannot render those terminal ANSI colors, so the colored status dots above show the same progression visually.
@@ -105,7 +105,7 @@ codex-context -v
 Example:
 
 ```text
-lore
+my-project
 
 ██████████░░░░░░░░░░░░░░  42%
 42.3k / 100k thread growth
