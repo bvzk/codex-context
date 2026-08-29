@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""
+codex-context v6
+
+Live Codex thread-growth monitor.
+
+Goal:
+- Ignore Codex/system/project bootstrap context ("baseline")
+- Track how much the thread itself has grown
+- Keep the counter monotonic across context compaction
+- Use a personal 100k safe cap
+- Read only local Codex rollout telemetry; no API/network
+
+Signal:
+  event_msg.payload.type == "token_count"
+  info.last_token_usage.total_tokens
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Optional
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+SESSIONS_DIR = CODEX_HOME / "sessions"
+ARCHIVED_DIR = CODEX_HOME / "archived_sessions"
+SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
+
+SAFE_CAP = 100_000
+BAR_WIDTH = 24
+
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+ORANGE = "\033[38;5;208m"
+RED = "\033[31m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+@dataclass
+class Usage:
+    path: Path
+    thread_id: str
+    cwd: Optional[str]
+    title: Optional[str]
+    baseline: int
+    current_context: int
+    growth: int
+    model_window: int
+    timestamp: Optional[str]
+    mtime: float
+
+    @property
+    def pct(self) -> float:
+        return self.growth / SAFE_CAP * 100.0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, SAFE_CAP - self.growth)
+
+
+def human_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        v = n / 1_000_000
+        return f"{v:.2f}m".rstrip("0").rstrip(".")
+    if n >= 1_000:
+        v = n / 1_000
+        return f"{v:.1f}k".rstrip("0").rstrip(".")
+    return str(n)
+
+
+def color_enabled() -> bool:
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(s: str, color: str) -> str:
+    return f"{color}{s}{RESET}" if color_enabled() else s
+
+
+def status_for(pct: float):
+    if pct >= 90:
+        return "🔴 NEW THREAD RECOMMENDED", RED
+    if pct >= 82:
+        return "🟠 WRAP UP SOON", ORANGE
+    if pct >= 70:
+        return "🟡 CONTEXT GETTING FULL", YELLOW
+    return "🟢 HEALTHY", GREEN
+
+
+def find_rollouts(include_archived: bool = False) -> list[Path]:
+    files: list[Path] = []
+    if SESSIONS_DIR.exists():
+        files.extend(SESSIONS_DIR.rglob("rollout-*.jsonl"))
+    if include_archived and ARCHIVED_DIR.exists():
+        files.extend(ARCHIVED_DIR.glob("rollout-*.jsonl"))
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def extract_meta(path: Path) -> tuple[str, Optional[str]]:
+    thread_id = ""
+    cwd = None
+    try:
+        with path.open("rb") as f:
+            for _ in range(40):
+                raw = f.readline(512_000)
+                if not raw:
+                    break
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                payload = obj.get("payload") or {}
+                if obj.get("type") == "session_meta":
+                    thread_id = str(payload.get("id") or payload.get("session_id") or "")
+                    cwd = payload.get("cwd")
+                    return thread_id, cwd
+                if not thread_id:
+                    thread_id = str(payload.get("thread_id") or obj.get("thread_id") or payload.get("id") or "")
+                if cwd is None:
+                    cwd = payload.get("cwd") or obj.get("cwd")
+    except Exception:
+        pass
+
+    if not thread_id:
+        stem = path.stem
+        parts = stem.split("-")
+        if len(parts) >= 7:
+            thread_id = "-".join(parts[-5:])
+    return thread_id, cwd
+
+
+def iter_token_counts(path: Path) -> Iterable[tuple[int, int, Optional[str]]]:
+    try:
+        with path.open("rb") as f:
+            for raw in f:
+                if b'"token_count"' not in raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                payload = obj.get("payload") or {}
+                if obj.get("type") != "event_msg" or payload.get("type") != "token_count":
+                    continue
+                info = payload.get("info") or {}
+                last = info.get("last_token_usage") or {}
+                used = last.get("total_tokens")
+                window = info.get("model_context_window")
+                if isinstance(used, (int, float)) and isinstance(window, (int, float)) and window > 0:
+                    yield int(used), int(window), obj.get("timestamp")
+    except (OSError, PermissionError):
+        return
+
+
+def calculate_growth(path: Path) -> Optional[tuple[int, int, int, int, Optional[str]]]:
+    first = None
+    previous = None
+    growth = 0
+    current = None
+    window = None
+    timestamp = None
+
+    for used, win, ts in iter_token_counts(path):
+        if first is None:
+            first = used
+            previous = used
+            current = used
+            window = win
+            timestamp = ts
+            continue
+        if previous is not None and used > previous:
+            growth += used - previous
+        previous = used
+        current = used
+        window = win
+        timestamp = ts
+
+    if first is None or current is None or window is None:
+        return None
+    return first, current, growth, window, timestamp
+
+
+def load_titles() -> dict[str, str]:
+    titles: dict[str, str] = {}
+    if not SESSION_INDEX.exists():
+        return titles
+    try:
+        with SESSION_INDEX.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                tid = str(obj.get("id") or obj.get("thread_id") or obj.get("session_id") or "")
+                title = obj.get("title") or obj.get("name") or obj.get("display_name") or obj.get("summary")
+                if tid and isinstance(title, str) and title.strip():
+                    titles[tid] = title.strip()
+    except Exception:
+        pass
+    return titles
+
+
+def usage_for(path: Path, titles: dict[str, str]) -> Optional[Usage]:
+    calc = calculate_growth(path)
+    if not calc:
+        return None
+    baseline, current, growth, window, timestamp = calc
+    thread_id, cwd = extract_meta(path)
+    return Usage(path, thread_id, cwd, titles.get(thread_id), baseline, current, growth, window, timestamp, path.stat().st_mtime)
+
+
+def same_project(session_cwd: Optional[str], cwd: Path) -> bool:
+    if not session_cwd:
+        return False
+    try:
+        return Path(session_cwd).expanduser().resolve() == cwd.resolve()
+    except Exception:
+        return session_cwd == str(cwd)
+
+
+def choose_current(files: list[Path], cwd: Path, titles: dict[str, str]) -> Optional[Usage]:
+    recent = files[:100]
+    for path in recent:
+        _, scwd = extract_meta(path)
+        if same_project(scwd, cwd):
+            u = usage_for(path, titles)
+            if u:
+                return u
+    for path in recent:
+        u = usage_for(path, titles)
+        if u:
+            return u
+    return None
+
+
+def project_name(u: Usage) -> str:
+    if u.cwd:
+        return Path(u.cwd).name or u.cwd
+    return u.path.parent.name
+
+
+def display_name(u: Usage) -> str:
+    project = project_name(u)
+    if u.title and u.title.lower() != project.lower():
+        return f"{project} — {u.title}"
+    return project
+
+
+def render(u: Usage, compact: bool = True) -> str:
+    pct = min(999.9, u.pct)
+    fill = min(BAR_WIDTH, max(0, round(BAR_WIDTH * min(pct, 100) / 100)))
+    filled_bar = "█" * fill
+    empty_bar = "░" * (BAR_WIDTH - fill)
+    status, color = status_for(pct)
+    colored_bar = c(filled_bar, color) + c(empty_bar, DIM)
+
+    if compact:
+        return f"{display_name(u)}  {colored_bar}  {c(f'{pct:.0f}%', color)}  {human_tokens(u.growth)} / {human_tokens(SAFE_CAP)}  {c(status, color)}"
+
+    return "\n".join([
+        c(display_name(u), BOLD), "",
+        f"{colored_bar}  {c(f'{pct:.0f}%', color)}",
+        f"{human_tokens(u.growth)} / {human_tokens(SAFE_CAP)} thread growth",
+        f"{human_tokens(u.remaining)} remaining to safe cap", "",
+        f"Baseline        {human_tokens(u.baseline)}",
+        f"Current context {human_tokens(u.current_context)}",
+        f"Model window    {human_tokens(u.model_window)}", "",
+        c(status, color),
+    ])
+
+
+def snapshot(args) -> Optional[Usage]:
+    files = find_rollouts(include_archived=args.archived)
+    titles = load_titles()
+    cwd = Path(args.cwd or os.getcwd())
+    return choose_current(files, cwd, titles)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="codex-context", description="Live baseline-aware Codex thread-growth meter.")
+    p.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    p.add_argument("--interval", type=float, default=1.0, help="refresh seconds (default: 1)")
+    p.add_argument("--verbose", "-v", action="store_true", help="show baseline/context details")
+    p.add_argument("--archived", action="store_true", help="also consider archived sessions")
+    p.add_argument("--cwd", help="select session matching this project directory")
+    args = p.parse_args()
+
+    def output_once() -> tuple[int, str]:
+        u = snapshot(args)
+        if not u:
+            return 1, "Waiting for Codex token telemetry…"
+        return 0, render(u, compact=not args.verbose)
+
+    if args.once:
+        code, out = output_once()
+        print(out)
+        return code
+
+    try:
+        last_width = 0
+        while True:
+            _, out = output_once()
+            if sys.stdout.isatty():
+                if args.verbose:
+                    print("\033[2J\033[H" + out, end="", flush=True)
+                else:
+                    plain_len = len(re.sub(r"\x1b\[[0-9;]*m", "", out))
+                    pad = " " * max(0, last_width - plain_len)
+                    print("\r\033[2K" + out + pad, end="", flush=True)
+                    last_width = plain_len
+            else:
+                print(out, flush=True)
+            time.sleep(max(0.25, args.interval))
+    except KeyboardInterrupt:
+        if sys.stdout.isatty():
+            print()
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
